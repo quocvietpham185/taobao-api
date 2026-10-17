@@ -24,6 +24,10 @@ ENV/
 *.apk
 frida-server*
 out/
+target/
+unidbg-server/target/
+temp_class/
+unidbg-server/temp_class/
 
 # Screenshots, Captured Images & Media
 *.png
