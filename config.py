@@ -20,6 +20,10 @@ class Settings(BaseModel):
         "http://zp84784_pxx5hg:bfhnYFG2XPQUb54L_country-cn@amz6.zingproxy.com:31112",
     ]
     
+    # Optional: Taobao user session cookie for unrestricted LIVE searching
+    # When provided, all queries bypass WAF guest challenge
+    COOKIE: str = ""
+    
     # Request timeouts
     REQUEST_TIMEOUT: int = 15
     RETRY_TIMES: int = 3

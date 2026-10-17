@@ -41,31 +41,44 @@ async def health_check():
         "proxy_pool_size": len(settings.PROXIES)
     }
 
+@app.post("/api/v1/config/cookie", tags=["System Configuration"])
+async def set_system_cookie(
+    cookie: str = Query(..., description="Chuỗi Cookie Taobao để lưu cố định cho toàn bộ hệ thống")
+):
+    """
+    Cài đặt chuỗi Cookie Taobao dùng chung cho toàn bộ Server.
+    Sau khi cài đặt ở đây, bạn không cần phải nhập cookie ở từng API riêng lẻ nữa.
+    """
+    settings.COOKIE = cookie
+    return {"status": "success", "message": "Cookie has been saved successfully!"}
+
 @app.get("/api/v1/search", response_model=List[SearchItem], tags=["Taobao Product API"])
 async def search_products(
-    q: str = Query(..., description="Từ khóa tìm kiếm sản phẩm (ví dụ: shoes, phone, áo thun)"),
-    page: int = Query(1, ge=1, description="Số trang tìm kiếm (mặc định: 1)")
+    q: str = Query(..., description="Từ khóa tìm kiếm sản phẩm (ví dụ: shoes, phone, áo thun, ipad pro m1)"),
+    page: int = Query(1, ge=1, description="Số trang tìm kiếm (mặc định: 1)"),
+    cookie: Optional[str] = Query(None, description="Chuỗi Cookie Taobao (tùy chọn, dán vào đây để tìm kiếm LIVE 100%)")
 ):
     """
     Tìm kiếm sản phẩm trên Taobao theo từ khóa.
     Trả về danh sách: item_id, tiêu đề, giá tiền, số lượng bán, ảnh thumb, tên shop.
     """
     try:
-        results = client.search(keyword=q, page=page)
+        results = client.search(keyword=q, page=page, cookie=cookie)
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/detail", response_model=ProductDetail, tags=["Taobao Product API"])
 async def get_product_detail(
-    item_id: str = Query(..., description="Mã sản phẩm Taobao (item_id / itemNumId, ví dụ: 601444443407)")
+    item_id: str = Query(..., description="Mã sản phẩm Taobao (item_id / itemNumId, ví dụ: 601444443407)"),
+    cookie: Optional[str] = Query(None, description="Chuỗi Cookie Taobao (tùy chọn)")
 ):
     """
     Lấy thông tin chi tiết sản phẩm Taobao.
     Trả về: Tiêu đề, danh sách ảnh chất lượng cao, tên shop, khoảng giá, và toàn bộ ma trận biến thể SKU (phân loại, màu sắc, size, giá từng loại, ảnh phân loại, số lượng tồn kho).
     """
     try:
-        detail = client.get_detail(item_id=item_id)
+        detail = client.get_detail(item_id=item_id, cookie=cookie)
         return detail
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -73,14 +86,15 @@ async def get_product_detail(
 @app.get("/api/v1/reviews", response_model=List[ProductReview], tags=["Taobao Product API"])
 async def get_product_reviews(
     item_id: str = Query(..., description="Mã sản phẩm Taobao (item_id)"),
-    page: int = Query(1, ge=1, description="Trang đánh giá (mặc định: 1)")
+    page: int = Query(1, ge=1, description="Trang đánh giá (mặc định: 1)"),
+    cookie: Optional[str] = Query(None, description="Chuỗi Cookie Taobao (tùy chọn)")
 ):
     """
     Lấy đánh giá (review) của khách hàng về sản phẩm.
     Trả về: Tên người mua, nội dung đánh giá gốc tiếng Trung, số sao, ngày đánh giá, phân loại đã mua, ảnh khách chụp.
     """
     try:
-        reviews = client.get_reviews(item_id=item_id, page=page)
+        reviews = client.get_reviews(item_id=item_id, page=page, cookie=cookie)
         return reviews
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

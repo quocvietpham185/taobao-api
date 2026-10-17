@@ -72,9 +72,16 @@ class MtopClient:
 
         return ""
 
-    def _call_h5_api(self, api: str, v: str, data: Dict[str, Any], referer: str = "https://www.taobao.com/") -> Dict[str, Any]:
+    def _call_h5_api(self, api: str, v: str, data: Dict[str, Any], referer: str = "https://www.taobao.com/", cookie: Optional[str] = None) -> Dict[str, Any]:
         proxy = self.get_proxy()
-        token = self._ensure_h5_token(proxy)
+        active_cookie = cookie or settings.COOKIE
+        token = ""
+        if active_cookie:
+            m_token = re.search(r'_m_h5_tk=([a-f0-9]+)', active_cookie)
+            if m_token:
+                token = m_token.group(1)
+        if not token:
+            token = self._ensure_h5_token(proxy)
 
         data_str = json.dumps(data, separators=(',', ':'))
         t = str(int(time.time() * 1000))
@@ -88,6 +95,8 @@ class MtopClient:
             "Referer": referer,
             "Accept": "*/*"
         }
+        if active_cookie:
+            headers["cookie"] = active_cookie
         params = {
             "jsv": "2.7.2",
             "appKey": self.app_key,
@@ -117,7 +126,7 @@ class MtopClient:
         except Exception:
             return {"raw_text": text}
 
-    def search(self, keyword: str, page: int = 1) -> List[SearchItem]:
+    def search(self, keyword: str, page: int = 1, cookie: Optional[str] = None) -> List[SearchItem]:
         api = "mtop.taobao.wsearch.appsearch"
         v = "1.0"
         data = {
@@ -133,11 +142,11 @@ class MtopClient:
             body = rpc_res.get("body", "{}")
             raw = json.loads(body) if body else {}
         else:
-            raw = self._call_h5_api(api, v, data, referer="https://s.taobao.com/")
+            raw = self._call_h5_api(api, v, data, referer="https://s.taobao.com/", cookie=cookie)
 
         items = parse_search_response(raw)
-        # If live call challenged by WAF without active cookie, fallback to real cached catalog
-        if not items and os.path.exists("api_test_results.json"):
+        # If live call challenged by WAF without active cookie and looking for sample iPhone
+        if not items and not cookie and not settings.COOKIE and os.path.exists("api_test_results.json"):
             try:
                 with open("api_test_results.json", "r", encoding="utf-8") as f:
                     cache = json.load(f)
@@ -148,7 +157,7 @@ class MtopClient:
                 pass
         return items
 
-    def get_detail(self, item_id: str) -> ProductDetail:
+    def get_detail(self, item_id: str, cookie: Optional[str] = None) -> ProductDetail:
         api = "mtop.taobao.detail.getdetail"
         v = "6.0"
         data = {"itemNumId": str(item_id)}
@@ -158,10 +167,10 @@ class MtopClient:
             body = rpc_res.get("body", "{}")
             raw = json.loads(body) if body else {}
         else:
-            raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}")
+            raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}", cookie=cookie)
 
         detail = parse_detail_response(raw)
-        if not detail.item_id:
+        if not detail.item_id and not cookie and not settings.COOKIE:
             # Fallback to verified real SKU matrix for demonstration/testing
             detail = ProductDetail(
                 item_id=str(item_id),
@@ -201,7 +210,7 @@ class MtopClient:
             )
         return detail
 
-    def get_reviews(self, item_id: str, page: int = 1) -> List[ProductReview]:
+    def get_reviews(self, item_id: str, page: int = 1, cookie: Optional[str] = None) -> List[ProductReview]:
         api = "mtop.taobao.detail.getrate"
         v = "1.0"
         data = {
@@ -215,10 +224,10 @@ class MtopClient:
             body = rpc_res.get("body", "{}")
             raw = json.loads(body) if body else {}
         else:
-            raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}")
+            raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}", cookie=cookie)
 
         reviews = parse_review_response(raw)
-        if not reviews:
+        if not reviews and not cookie and not settings.COOKIE:
             reviews = [
                 ProductReview(
                     author="t***8 (淘气值 850)",
