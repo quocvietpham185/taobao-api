@@ -1,0 +1,71 @@
+# ========================================================
+# Gitignore for Taobao MTOP API Service (Client Handover)
+# ========================================================
+
+# IDE & AI Assistant Folders
+.aevum/
+.agents/
+.antigravitycli/
+.gemini/
+.idea/
+.vscode/
+
+# Python Cache & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+ENV/
+
+# Binaries, Packages & Frida Servers
+*.apk
+frida-server*
+out/
+
+# Screenshots, Captured Images & Media
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.webp
+*.xz
+
+# HTML & Log Dumps
+*.html
+*.log
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# JSON Artifacts, Cookies & Test Outputs
+*.json
+
+# All Temporary & Diagnostic Scratch Scripts
+test_*.py
+check_*.py
+inspect_*.py
+dump_*.py
+save_*.py
+scan_*.py
+capture_*.py
+hook_*.py
+setup_*.py
+download_*.py
+get_*.py
+trace_*.py
+extract_*.py
+find_*.py
+display_*.py
+query_*.py
+spawn_*.py
+run_live_*.py
+rpc_taobao_sign.py
+
+# Text Scratch & Proxy Lists
+*.txt
+!requirements.txt
