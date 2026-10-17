@@ -65,6 +65,8 @@ query_*.py
 spawn_*.py
 run_live_*.py
 rpc_taobao_sign.py
+scratch/
+scratch_*.py
 
 # Text Scratch & Proxy Lists
 *.txt

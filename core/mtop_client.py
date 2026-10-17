@@ -10,6 +10,10 @@ from curl_cffi import requests
 
 from config import settings
 from core.rpc_signer import RpcSigner
+try:
+    from core.unidbg_signer import UnidbgSigner
+except ImportError:
+    UnidbgSigner = None
 from core.parser import (
     parse_search_response, 
     parse_detail_response, 
@@ -19,25 +23,28 @@ from core.parser import (
     ProductReview,
     SkuVariant
 )
+from core.captcha_solver import CaptchaSolver
 
 logger = logging.getLogger("mtop_client")
 
 class MtopClient:
     """
-    High-level MTOP client supporting two operating modes:
-    1. Pure Python Mode (Default, Plug-and-Play):
-       - Requires NO Android device, NO Frida, NO phone setup.
-       - Signs requests via pure MD5 and rotates residential proxies.
-    2. Android RPC Mode (Advanced):
-       - Uses connected Android Frida node to generate WUA device signatures.
+    High-level MTOP client supporting multiple execution backends:
+    1. Unidbg Pure ARM Mode (Top tier, Zero Phone/Zero Cookie):
+       - Emulates ARM CPU in memory running official libsgmain.so (SecurityGuard 6.8).
+       - Generates authentic x-sign, wua, x-mini-wua cryptographic tokens.
+    2. Pure Python / Residential Proxy Mode:
+       - Plug-and-play with rotating China residential proxies.
+    3. Android Frida RPC Mode (Optional hardware fallback).
     """
     def __init__(self):
         self.proxies = settings.PROXIES
         self.app_key = "12574478"
         self.session = requests.Session()
+        self.unidbg_signer = UnidbgSigner.get_instance()
         self.rpc_signer = None
 
-        # Check if Frida node is available
+        # Check if Frida node is optionally available
         try:
             self.rpc_signer = RpcSigner.get_instance()
             if not self.rpc_signer.connect():
@@ -72,8 +79,45 @@ class MtopClient:
 
         return ""
 
-    def _call_h5_api(self, api: str, v: str, data: Dict[str, Any], referer: str = "https://www.taobao.com/", cookie: Optional[str] = None) -> Dict[str, Any]:
+    def _update_session_cookies(self, new_cookie_str: str):
+        """
+        Merges new cookies (especially x5sec) into active session,
+        settings.COOKIE, and persists to working_cookie.txt.
+        """
+        if not new_cookie_str:
+            return
+            
+        new_parts = [p.strip() for p in new_cookie_str.split(";") if p.strip()]
+        new_dict = {}
+        for p in new_parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                new_dict[k.strip()] = v.strip()
+                
+        existing_dict = {}
+        if settings.COOKIE:
+            for p in settings.COOKIE.split(";"):
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    existing_dict[k.strip()] = v.strip()
+                    
+        existing_dict.update(new_dict)
+        merged_str = "; ".join([f"{k}={v}" for k, v in existing_dict.items()])
+        settings.COOKIE = merged_str
+        
+        try:
+            with open("working_cookie.txt", "w", encoding="utf-8") as f:
+                f.write(merged_str)
+        except Exception as e:
+            logger.warning(f"Failed to persist working_cookie.txt: {e}")
+            
+        logger.info(f"[+] Cookies updated and persisted! Has x5sec: {'x5sec' in existing_dict}")
+
+    def _call_h5_api(self, api: str, v: str, data: Dict[str, Any], referer: str = "https://www.taobao.com/", cookie: Optional[str] = None, retry_count: int = 0) -> Dict[str, Any]:
         proxy = self.get_proxy()
+        # Sanitize cookie if user accidentally left Swagger placeholder
+        if cookie and cookie.strip().lower() in ["cookie", "string", "none", "null", "undefined"]:
+            cookie = None
         active_cookie = cookie or settings.COOKIE
         token = ""
         if active_cookie:
@@ -114,17 +158,108 @@ class MtopClient:
         
         # Parse JSONP or JSON response
         text = resp.text
+        res_data = None
         m = re.search(r'mtopjsonp\d*\((.*)\)', text)
         if m:
             try:
-                return json.loads(m.group(1))
+                res_data = json.loads(m.group(1))
             except Exception:
                 pass
 
+        if res_data is None:
+            try:
+                res_data = resp.json()
+            except Exception:
+                res_data = {"raw_text": text}
+
+        # Check if RGV587 or punish challenge is returned
+        ret_list = res_data.get("ret", []) if isinstance(res_data, dict) else []
+        is_blocked = (
+            any("RGV587" in str(r) for r in ret_list) or 
+            "set_x5referer" in text or 
+            "_____tmd_____" in text or 
+            "RGV587" in text
+        )
+
+        if is_blocked and retry_count < 1:
+            logger.info("[*] Detected Taobao WAF Challenge (RGV587 / set_x5referer). Invoking CaptchaSolver...")
+            punish_url = None
+            if isinstance(res_data, dict) and isinstance(res_data.get("data"), dict):
+                punish_url = res_data["data"].get("url")
+            
+            if not punish_url:
+                url_m = re.search(r'location\.href\s*=\s*["\']([^"\']+)["\']', text)
+                if url_m:
+                    punish_url = url_m.group(1)
+                else:
+                    url_m = re.search(r'["\'](https?://[^"\']*set_x5referer[^"\']*)["\']', text)
+                    if url_m:
+                        punish_url = url_m.group(1)
+                    else:
+                        url_m = re.search(r'["\'](https?://[^"\']*_____tmd_____[^"\']*)["\']', text)
+                        if url_m:
+                            punish_url = url_m.group(1)
+
+            if punish_url:
+                proxy_str = settings.PROXIES[0] if settings.PROXIES else None
+                new_cookie = CaptchaSolver.get_instance().solve_punish_url(punish_url, proxy_url=proxy_str)
+                if new_cookie:
+                    self._update_session_cookies(new_cookie)
+                    logger.info("[+] Captcha solved! Retrying API request with new session cookie...")
+                    return self._call_h5_api(api, v, data, referer=referer, cookie=cookie, retry_count=retry_count + 1)
+                else:
+                    logger.warning("[-] Captcha solver failed to acquire x5sec token.")
+            else:
+                logger.warning("[-] Could not parse punish URL from response to solve captcha.")
+
+        if is_blocked:
+            return {
+                "ret": ["RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!"],
+                "data": {},
+                "raw_text": text
+            }
+
+        return res_data
+
+    def _call_native_mtop(self, api: str, v: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Calls native MTOP gateway (guide-acs.m.taobao.com or trade-acs.m.taobao.com)
+        using authentic ARM CPU SecurityGuard signatures generated by Unidbg in-memory daemon.
+        """
+        if not self.unidbg_signer or not self.unidbg_signer.is_available():
+            return {}
+
+        t = str(int(time.time()))
+        data_str = json.dumps(data, separators=(',', ':'))
+        sign_info = self.unidbg_signer.sign(api, v, data, t)
+        x_sign = sign_info.get("x_sign", "")
+        wua = sign_info.get("wua", "")
+        x_mini_wua = sign_info.get("x_mini_wua", "")
+
+        host = "guide-acs.m.taobao.com" if "wsearch" in api else "trade-acs.m.taobao.com"
+        headers = {
+            "x-appkey": "21646297",
+            "x-ttid": "701188@taobao_android_10.36.20",
+            "x-utdid": "Z074F9P6hEMDAN87W/qL8z2k",
+            "x-t": t,
+            "x-sign": x_sign,
+            "x-pv": "6.3",
+            "x-features": "27",
+            "x-mini-wua": x_mini_wua,
+            "wua": wua,
+            "f-refer": "mtop",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "User-Agent": "MTOPSDK/3.1.1.7 (Android;10;Xiaomi;MI 8)",
+            "Host": host
+        }
+        url = f"https://{host}/gw/{api}/{v}/"
+        proxy = self.get_proxy()
         try:
-            return resp.json()
-        except Exception:
-            return {"raw_text": text}
+            r = self.session.post(url, headers=headers, data={"data": data_str}, proxies=proxy, timeout=settings.REQUEST_TIMEOUT)
+            return r.json()
+        except Exception as e:
+            logger.debug(f"Native MTOP call notice: {e}")
+            return {}
 
     def search(self, keyword: str, page: int = 1, cookie: Optional[str] = None) -> List[SearchItem]:
         api = "mtop.taobao.wsearch.appsearch"
@@ -136,25 +271,37 @@ class MtopClient:
             "sort": "default"
         }
 
-        # If RPC node connected and no proxy specified, use RPC
-        if self.rpc_signer and not self.proxies:
-            rpc_res = self.rpc_signer.execute_api(api, v, data)
-            body = rpc_res.get("body", "{}")
-            raw = json.loads(body) if body else {}
-        else:
+        raw = {}
+        # 1. If Cookie is explicitly provided, prioritize H5 gateway with session
+        if cookie and cookie.strip().lower() not in ["cookie", "string", "none", "null", "undefined"]:
             raw = self._call_h5_api(api, v, data, referer="https://s.taobao.com/", cookie=cookie)
+        else:
+            # 2. Try native ARM Unidbg signer first (Zero Cookie mode)
+            if self.unidbg_signer and self.unidbg_signer.is_available():
+                native_raw = self._call_native_mtop(api, v, data)
+                ret_native = native_raw.get("ret", [])
+                if any("SUCCESS" in str(r) for r in ret_native) or native_raw.get("data"):
+                    raw = native_raw
+
+            # 3. Fallback to H5 gateway if native didn't produce data
+            if not raw or not raw.get("data"):
+                raw = self._call_h5_api(api, v, data, referer="https://s.taobao.com/", cookie=cookie)
 
         items = parse_search_response(raw)
-        # If live call challenged by WAF without active cookie and looking for sample iPhone
-        if not items and not cookie and not settings.COOKIE and os.path.exists("api_test_results.json"):
-            try:
-                with open("api_test_results.json", "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                    if "search" in cache:
-                        raw_c = json.loads(cache["search"].split("(", 1)[1].rsplit(")", 1)[0])
-                        items = parse_search_response(raw_c)
-            except Exception:
-                pass
+        if not items:
+            ret_list = raw.get("ret", [])
+            raw_text = raw.get("raw_text", "")
+            if any("RGV587" in str(r) for r in ret_list) or "set_x5referer" in raw_text or "_____tmd_____" in raw_text:
+                raise ValueError("Taobao WAF chống bot (RGV587_ERROR::SM::哎哟喂,被挤爆啦): IP yêu cầu xác minh Captcha. Vui lòng cấu hình Proxy sạch hoặc nạp Cookie tại /api/v1/config/cookie.")
+            elif any("FAIL_SYS_USER_VALIDATE" in str(r) for r in ret_list):
+                raise ValueError("Cookie Taobao của bạn đã hết hạn (FAIL_SYS_USER_VALIDATE). Vui lòng cập nhật Cookie mới tại /api/v1/config/cookie.")
+            elif any("FAIL_SYS_ILEGEL_SIGN" in str(r) for r in ret_list):
+                raise ValueError("Lỗi chữ ký MTOP (FAIL_SYS_ILEGEL_SIGN::非法请求签名): Cần kiểm tra lại chữ ký hoặc cung cấp Cookie tài khoản.")
+            elif ret_list:
+                raise ValueError(f"Không có kết quả từ Taobao: {', '.join(ret_list)}")
+            else:
+                raise ValueError(f"Không tìm thấy sản phẩm nào cho từ khóa '{keyword}'.")
+
         return items
 
     def get_detail(self, item_id: str, cookie: Optional[str] = None) -> ProductDetail:
@@ -162,52 +309,33 @@ class MtopClient:
         v = "6.0"
         data = {"itemNumId": str(item_id)}
 
-        if self.rpc_signer and not self.proxies:
-            rpc_res = self.rpc_signer.execute_api(api, v, data)
-            body = rpc_res.get("body", "{}")
-            raw = json.loads(body) if body else {}
-        else:
+        raw = {}
+        if cookie and cookie.strip().lower() not in ["cookie", "string", "none", "null", "undefined"]:
             raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}", cookie=cookie)
+        else:
+            if self.unidbg_signer and self.unidbg_signer.is_available():
+                native_raw = self._call_native_mtop(api, v, data)
+                ret_native = native_raw.get("ret", [])
+                if any("SUCCESS" in str(r) for r in ret_native) or native_raw.get("data"):
+                    raw = native_raw
+
+            if not raw or not raw.get("data"):
+                raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}", cookie=cookie)
 
         detail = parse_detail_response(raw)
-        if not detail.item_id and not cookie and not settings.COOKIE:
-            # Fallback to verified real SKU matrix for demonstration/testing
-            detail = ProductDetail(
-                item_id=str(item_id),
-                title="Apple/苹果 iPhone 17 手机 A19芯片 全新国行正品",
-                shop_name="中国联通手机官方旗舰店",
-                seller_id="2231547606",
-                main_images=[
-                    "https://g.search2.alicdn.com/img/bao/uploaded/i4/i4/2231547606/O1CN01BqVx76263bcFcc2Qa_!!4611686018427385558-2-item_pic.png",
-                    "https://g.search1.alicdn.com/img/bao/uploaded/i4/i4/713805254/O1CN01D0VhpYf8aLC1chua_!!4611686018427383238-0-item_pic.jpg"
-                ],
-                min_price=5899.00,
-                max_price=8999.00,
-                total_sales="9000+人付款",
-                skus=[
-                    SkuVariant(
-                        sku_id="6149441031882",
-                        properties="Màu sắc: Đen (Black); Dung lượng: 256GB",
-                        price=5899.00,
-                        stock=999,
-                        image="https://g.search2.alicdn.com/img/bao/uploaded/i4/i4/2231547606/O1CN01BqVx76263bcFcc2Qa_!!4611686018427385558-2-item_pic.png"
-                    ),
-                    SkuVariant(
-                        sku_id="6149441031883",
-                        properties="Màu sắc: Trắng (White); Dung lượng: 256GB",
-                        price=5899.00,
-                        stock=850,
-                        image="https://g.search2.alicdn.com/img/bao/uploaded/i4/i4/2231547606/O1CN01BqVx76263bcFcc2Qa_!!4611686018427385558-2-item_pic.png"
-                    ),
-                    SkuVariant(
-                        sku_id="6149441031884",
-                        properties="Màu sắc: Titan Tự Nhiên; Dung lượng: 512GB",
-                        price=7299.00,
-                        stock=420,
-                        image="https://g.search2.alicdn.com/img/bao/uploaded/i4/i4/2231547606/O1CN01BqVx76263bcFcc2Qa_!!4611686018427385558-2-item_pic.png"
-                    )
-                ]
-            )
+        if not detail.item_id:
+            ret_list = raw.get("ret", [])
+            raw_text = raw.get("raw_text", "")
+            if any("RGV587" in str(r) for r in ret_list) or "set_x5referer" in raw_text or "_____tmd_____" in raw_text:
+                raise ValueError(f"Không thể lấy chi tiết sản phẩm {item_id}: Taobao WAF yêu cầu trượt Captcha (RGV587_ERROR). Vui lòng cấu hình Proxy sạch hoặc nạp Cookie hợp lệ tại /api/v1/config/cookie.")
+            elif any("FAIL_SYS_USER_VALIDATE" in str(r) for r in ret_list):
+                raise ValueError(f"Không thể lấy chi tiết sản phẩm {item_id}: Cookie đã hết hạn (FAIL_SYS_USER_VALIDATE). Vui lòng cập nhật Cookie mới tại /api/v1/config/cookie.")
+            elif any("FAIL_SYS_ILEGEL_SIGN" in str(r) for r in ret_list):
+                raise ValueError(f"Lỗi chữ ký MTOP (FAIL_SYS_ILEGEL_SIGN::非法请求签名) khi truy vấn sản phẩm {item_id}.")
+            elif ret_list:
+                raise ValueError(f"Không thể lấy thông tin sản phẩm {item_id}. Phản hồi từ Taobao: {', '.join(ret_list)}")
+            else:
+                raise ValueError(f"Sản phẩm mã {item_id} không tồn tại hoặc đã bị xóa khỏi sàn Taobao.")
         return detail
 
     def get_reviews(self, item_id: str, page: int = 1, cookie: Optional[str] = None) -> List[ProductReview]:
@@ -219,29 +347,28 @@ class MtopClient:
             "pageSize": 20
         }
 
-        if self.rpc_signer and not self.proxies:
-            rpc_res = self.rpc_signer.execute_api(api, v, data)
-            body = rpc_res.get("body", "{}")
-            raw = json.loads(body) if body else {}
-        else:
+        raw = {}
+        if cookie and cookie.strip().lower() not in ["cookie", "string", "none", "null", "undefined"]:
             raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}", cookie=cookie)
+        else:
+            if self.unidbg_signer and self.unidbg_signer.is_available():
+                native_raw = self._call_native_mtop(api, v, data)
+                ret_native = native_raw.get("ret", [])
+                if any("SUCCESS" in str(r) for r in ret_native) or native_raw.get("data"):
+                    raw = native_raw
+
+            if not raw or not raw.get("data"):
+                raw = self._call_h5_api(api, v, data, referer=f"https://item.taobao.com/item.htm?id={item_id}", cookie=cookie)
 
         reviews = parse_review_response(raw)
-        if not reviews and not cookie and not settings.COOKIE:
-            reviews = [
-                ProductReview(
-                    author="t***8 (淘气值 850)",
-                    date="2026-10-15 14:22:10",
-                    rating=5,
-                    content="正品国行，物流非常快，顺丰隔天就到了，黑色手感很棒，拍照效果很清晰，推荐购买！",
-                    sku_info="颜色分类:黑色;存储容量:256GB"
-                ),
-                ProductReview(
-                    author="l***n (88VIP会员)",
-                    date="2026-10-16 09:15:33",
-                    rating=5,
-                    content="用了两天来评价的，屏幕显示特别细腻，电池续航比上一代明显提升，非常满意。",
-                    sku_info="颜色分类:白色;存储容量:512GB"
-                )
-            ]
+        if not reviews:
+            ret_list = raw.get("ret", [])
+            raw_text = raw.get("raw_text", "")
+            if any("RGV587" in str(r) for r in ret_list) or "set_x5referer" in raw_text or "_____tmd_____" in raw_text:
+                raise ValueError(f"Không thể lấy đánh giá cho sản phẩm {item_id}: Taobao WAF yêu cầu xác minh Captcha (RGV587_ERROR). Vui lòng nạp Cookie tại /api/v1/config/cookie.")
+            elif any("FAIL_SYS_USER_VALIDATE" in str(r) for r in ret_list):
+                raise ValueError(f"Không thể lấy đánh giá cho sản phẩm {item_id}: Cookie đã hết hạn (FAIL_SYS_USER_VALIDATE).")
+            elif any("FAIL_SYS_ILEGEL_SIGN" in str(r) for r in ret_list):
+                raise ValueError(f"Lỗi chữ ký MTOP (FAIL_SYS_ILEGEL_SIGN::非法请求签名) khi lấy đánh giá cho {item_id}.")
+            return []
         return reviews

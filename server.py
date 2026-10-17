@@ -5,13 +5,17 @@ from typing import List, Optional
 
 from config import settings
 from core.rpc_signer import RpcSigner
+try:
+    from core.unidbg_signer import UnidbgSigner
+except ImportError:
+    UnidbgSigner = None
 from core.mtop_client import MtopClient
 from core.parser import ProductDetail, SearchItem, ProductReview
 
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description="Production-ready Android RPC Farm API for Taobao (Search, Detail, Full SKU Matrix, Customer Reviews)"
+    description="Production-ready Android RPC Farm & Unidbg ARM CPU Emulation API for Taobao (Search, Detail, Full SKU Matrix, Customer Reviews)"
 )
 
 app.add_middleware(
@@ -26,19 +30,41 @@ client = MtopClient()
 
 @app.on_event("startup")
 async def startup_event():
+    import os
+    if os.path.exists("working_cookie.txt"):
+        try:
+            with open("working_cookie.txt", "r", encoding="utf-8") as f:
+                c = f.read().strip()
+                if c:
+                    settings.COOKIE = c
+        except Exception:
+            pass
     signer = RpcSigner.get_instance()
     signer.connect()
 
 @app.get("/health", tags=["System"])
 async def health_check():
+    unidbg_avail = False
+    unidbg_ep = ""
+    if UnidbgSigner:
+        try:
+            unidbg = UnidbgSigner.get_instance()
+            unidbg_avail = unidbg.is_available()
+            unidbg_ep = unidbg.endpoint
+        except Exception:
+            pass
     signer = RpcSigner.get_instance()
     is_connected = signer.is_connected()
     return {
         "status": "online",
+        "engine": "taobao-mtop-h5-crawler",
+        "unidbg_native_arm_operational": unidbg_avail,
+        "unidbg_endpoint": unidbg_ep,
+        "securityguard_version": "6.8.260901",
         "rpc_node_connected": is_connected,
         "device": settings.ADB_DEVICE,
-        "target_package": settings.TARGET_PACKAGE,
-        "proxy_pool_size": len(settings.PROXIES)
+        "proxy_pool_size": len(settings.PROXIES),
+        "has_active_cookie": bool(settings.COOKIE)
     }
 
 @app.post("/api/v1/config/cookie", tags=["System Configuration"])
@@ -50,7 +76,12 @@ async def set_system_cookie(
     Sau khi cài đặt ở đây, bạn không cần phải nhập cookie ở từng API riêng lẻ nữa.
     """
     settings.COOKIE = cookie
-    return {"status": "success", "message": "Cookie has been saved successfully!"}
+    try:
+        with open("working_cookie.txt", "w", encoding="utf-8") as f:
+            f.write(cookie)
+    except Exception:
+        pass
+    return {"status": "success", "message": "Cookie has been saved successfully and persisted to disk!"}
 
 @app.get("/api/v1/search", response_model=List[SearchItem], tags=["Taobao Product API"])
 async def search_products(
@@ -65,6 +96,9 @@ async def search_products(
     try:
         results = client.search(keyword=q, page=page, cookie=cookie)
         return results
+    except ValueError as e:
+        status_code = 403 if "WAF" in str(e) else 404
+        raise HTTPException(status_code=status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -80,6 +114,9 @@ async def get_product_detail(
     try:
         detail = client.get_detail(item_id=item_id, cookie=cookie)
         return detail
+    except ValueError as e:
+        status_code = 403 if "WAF" in str(e) else 404
+        raise HTTPException(status_code=status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -96,6 +133,9 @@ async def get_product_reviews(
     try:
         reviews = client.get_reviews(item_id=item_id, page=page, cookie=cookie)
         return reviews
+    except ValueError as e:
+        status_code = 403 if "WAF" in str(e) else 404
+        raise HTTPException(status_code=status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
