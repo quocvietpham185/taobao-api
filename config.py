@@ -17,7 +17,7 @@ class Settings(BaseModel):
     # Example: "http://username:password@proxy_host:proxy_port"
     # When deployed in China or with a China/HK proxy, set here:
     PROXIES: List[str] = [
-        # "http://username:password@hk-proxy.example.com:8080",
+        "http://zp84784_pxx5hg:bfhnYFG2XPQUb54L_country-cn@amz6.zingproxy.com:31112",
     ]
     
     # Request timeouts
